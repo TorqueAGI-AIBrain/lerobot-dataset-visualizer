@@ -493,24 +493,36 @@ function EpisodeViewerInner({
         }
       } else if (key === "ArrowDown" || key === "ArrowUp") {
         e.preventDefault();
+        // Step to the adjacent episode that EXISTS. Ids need not be contiguous
+        // (a split can hold 27, 28, 31), so +/-1 with an endpoint bounds check
+        // can land on a gap. `episodes` is ascending.
+        const stepTo = (from: number): number | null => {
+          const forward = key === "ArrowDown";
+          const at = s.episodes.indexOf(from);
+          if (at !== -1) {
+            const next = s.episodes[at + (forward ? 1 : -1)];
+            return next ?? null;
+          }
+          // Current id absent from the list: fall back to the nearest id in the
+          // direction of travel.
+          const candidates = forward
+            ? s.episodes.filter((id) => id > from)
+            : s.episodes.filter((id) => id < from);
+          if (candidates.length === 0) return null;
+          return forward
+            ? candidates[0]
+            : candidates[candidates.length - 1];
+        };
+
         if (s.activeTab === "urdf") {
-          const nextEp =
-            key === "ArrowDown" ? s.urdfEpisode + 1 : s.urdfEpisode - 1;
-          const lowest = s.episodes[0];
-          const highest = s.episodes[s.episodes.length - 1];
-          if (nextEp >= lowest && nextEp <= highest) {
+          const nextEp = stepTo(s.urdfEpisode);
+          if (nextEp !== null) {
             setUrdfEpisode(nextEp);
             urdfChangerRef.current?.(nextEp);
           }
         } else {
-          const nextEpisodeId =
-            key === "ArrowDown" ? s.episodeId + 1 : s.episodeId - 1;
-          const lowestEpisodeId = s.episodes[0];
-          const highestEpisodeId = s.episodes[s.episodes.length - 1];
-          if (
-            nextEpisodeId >= lowestEpisodeId &&
-            nextEpisodeId <= highestEpisodeId
-          ) {
+          const nextEpisodeId = stepTo(s.episodeId);
+          if (nextEpisodeId !== null) {
             router.push(`./episode_${nextEpisodeId}`);
           }
         }

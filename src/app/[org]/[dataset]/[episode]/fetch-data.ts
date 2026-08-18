@@ -377,12 +377,21 @@ export async function getAdjacentEpisodesVideoInfo(
     const totalEpisodes = info.total_episodes;
     const adjacentVideos: AdjacentEpisodeVideos[] = [];
 
+    // Which ids exist. For v3.0 read them; ids need not be 0..N-1 (see
+    // loadEpisodeIndices). Fall back to the count when unavailable (v2.x).
+    const knownIndices =
+      version === "v3.0"
+        ? new Set(await loadEpisodeIndices(repoId, version))
+        : null;
+    const episodeExists = (id: number) =>
+      knownIndices ? knownIndices.has(id) : id >= 0 && id < totalEpisodes;
+
     // Calculate adjacent episode IDs
     for (let offset = -radius; offset <= radius; offset++) {
       if (offset === 0) continue; // Skip current episode
 
       const episodeId = currentEpisodeId + offset;
-      if (episodeId >= 0 && episodeId < totalEpisodes) {
+      if (episodeExists(episodeId)) {
         try {
           let videosInfo: VideoInfo[] = [];
 
@@ -690,7 +699,13 @@ async function getEpisodeDataV3(
     cameras: [],
   };
 
-  const episodes = Array.from({ length: info.total_episodes }, (_, i) => i);
+  // The ids the dataset actually has, not 0..N-1 — see loadEpisodeIndices.
+  // Falls back to the count-derived range if the metadata cannot be read.
+  const realIndices = await loadEpisodeIndices(repoId, version);
+  const episodes =
+    realIndices.length > 0
+      ? realIndices
+      : Array.from({ length: info.total_episodes }, (_, i) => i);
 
   // Load episode metadata to get timestamps for episode 0
   const episodeMetadata = await loadEpisodeMetadataV3Simple(
@@ -1217,6 +1232,77 @@ async function* iterateEpisodeMetadataFilesV3(
     yield rows;
     fileIndex++;
   }
+}
+
+// Episode-index cache. Reading every meta/episodes parquet on each page load is
+// wasteful when the answer only changes if the dataset does. Mirrors the TTL+LRU
+// shape of the dataset-info cache in versionUtils.
+const episodeIndicesCache = new Map<
+  string,
+  { data: number[]; expiry: number }
+>();
+const EPISODE_INDICES_TTL_MS = 5 * 60 * 1000;
+const MAX_EPISODE_INDICES_ENTRIES = Math.max(
+  8,
+  parseInt(process.env.MAX_EPISODE_INDICES_CACHE_ENTRIES ?? "64", 10) || 64,
+);
+
+function pruneEpisodeIndicesCache(now: number) {
+  for (const [key, value] of episodeIndicesCache) {
+    if (now >= value.expiry) episodeIndicesCache.delete(key);
+  }
+  while (episodeIndicesCache.size > MAX_EPISODE_INDICES_ENTRIES) {
+    const oldest = episodeIndicesCache.keys().next().value;
+    if (!oldest) break;
+    episodeIndicesCache.delete(oldest);
+  }
+}
+
+/**
+ * The episode indices a dataset actually contains, ascending.
+ *
+ * `info.json`'s `total_episodes` is a COUNT, not a range. A split written with
+ * `episode_indices_renumbered: false` keeps its parent dataset's numbering, so a
+ * two-episode split can legitimately hold episodes 27 and 28. Deriving ids from
+ * the count asks for 0..N-1 and finds nothing.
+ *
+ * Returns `[]` for anything other than v3.0, so callers keep their previous
+ * count-derived behaviour on v2.x (where ids really are 0-based).
+ */
+export async function loadEpisodeIndices(
+  repoId: string,
+  version: string,
+): Promise<number[]> {
+  if (version !== "v3.0") return [];
+
+  const now = Date.now();
+  pruneEpisodeIndicesCache(now);
+
+  const key = `${repoId}@${version}`;
+  const cached = episodeIndicesCache.get(key);
+  if (cached && now < cached.expiry) {
+    episodeIndicesCache.delete(key);
+    episodeIndicesCache.set(key, cached); // refresh LRU position
+    return cached.data;
+  }
+
+  const indices: number[] = [];
+  for await (const rows of iterateEpisodeMetadataFilesV3(repoId, version)) {
+    for (const row of rows) {
+      // parseEpisodeRowSimple normalises BigInt -> number, so these are safe to
+      // compare and sort numerically.
+      indices.push(parseEpisodeRowSimple(row).episode_index);
+    }
+  }
+  indices.sort((a, b) => a - b);
+
+  episodeIndicesCache.set(key, {
+    data: indices,
+    expiry: now + EPISODE_INDICES_TTL_MS,
+  });
+  pruneEpisodeIndicesCache(now);
+
+  return indices;
 }
 
 // Metadata loading for v3.0 episodes

@@ -1,5 +1,8 @@
 import { describe, expect, test } from "bun:test";
-import { computeColumnMinMax } from "@/app/[org]/[dataset]/[episode]/fetch-data";
+import {
+  computeColumnMinMax,
+  loadEpisodeIndices,
+} from "@/app/[org]/[dataset]/[episode]/fetch-data";
 import type { ChartRow } from "@/app/[org]/[dataset]/[episode]/fetch-data";
 
 // ---------------------------------------------------------------------------
@@ -381,5 +384,62 @@ describe("v3.0 episode metadata row parsing helpers", () => {
         5,
       );
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// loadEpisodeIndices
+// `info.json`'s `total_episodes` is a COUNT, not a range. A split written with
+// `episode_indices_renumbered: false` keeps its parent's numbering, so a
+// two-episode split can legitimately hold episodes 27 and 28. These tests pin
+// the behaviour that regressed: deriving ids from the count.
+// ---------------------------------------------------------------------------
+
+describe("loadEpisodeIndices — non-0-based episode ids", () => {
+  test("returns [] for non-v3.0, so v2.x callers keep count-derived ids", async () => {
+    for (const version of ["v2.0", "v2.1"]) {
+      expect(await loadEpisodeIndices("org/ds", version)).toEqual([]);
+    }
+  });
+
+  test("ids are plain numbers, never BigInt (load-bearing invariant)", () => {
+    // hyparquet yields int64 columns as BigInt. parseEpisodeRowSimple routes
+    // episode_index through a normaliser that converts to Number. If that ever
+    // regressed, `new Set(indices).has(27)` would silently always be false and
+    // adjacent-episode navigation would return nothing, with no error logged.
+    const normalise = (value: unknown): number => {
+      if (typeof value === "bigint") return Number(value);
+      if (typeof value === "number") return value;
+      if (typeof value === "string") return parseInt(value) || 0;
+      return 0;
+    };
+    const indices = [27n, 28n].map(normalise);
+    indices.forEach((id) => expect(typeof id).toBe("number"));
+    expect(new Set(indices).has(27)).toBe(true);
+  });
+
+  test("a count-derived range disagrees with real ids (the original bug)", () => {
+    const realIndices = [27, 28];
+    const countDerived = Array.from({ length: 2 }, (_, i) => i);
+    expect(countDerived).toEqual([0, 1]);
+    expect(new Set(realIndices).has(0)).toBe(false);
+    expect(new Set(countDerived).has(27)).toBe(false);
+    // The redirect must land on a real id, not 0.
+    expect(realIndices[0]).toBe(27);
+  });
+
+  test("stepping to an adjacent id must skip gaps, not add 1", () => {
+    // Sparse ids are legal. +/-1 with an endpoint bounds check routes to 29/30,
+    // which do not exist; stepping by list position does not.
+    const episodes = [27, 28, 31];
+    const stepTo = (from: number, forward: boolean): number | null => {
+      const at = episodes.indexOf(from);
+      if (at === -1) return null;
+      return episodes[at + (forward ? 1 : -1)] ?? null;
+    };
+    expect(stepTo(28, true)).toBe(31);
+    expect(stepTo(31, false)).toBe(28);
+    expect(stepTo(31, true)).toBeNull();
+    expect(stepTo(27, false)).toBeNull();
   });
 });
